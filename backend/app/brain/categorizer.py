@@ -197,6 +197,7 @@ class Categorizer:
             if (
                 self.loan is not None
                 and tx.amount < 0
+                and text not in self._learned  # a manual choice always wins
                 and _first_match(text, R.MORTGAGE_PHRASES)
             ):
                 try:
@@ -212,7 +213,7 @@ class Categorizer:
             if is_duplicate:
                 explanation += f" Possible duplicate of row {seen[key]}."
             else:
-                seen[key] = tx.row_number
+                seen[key] = index
 
             results.append(
                 CategorizedTransaction(
