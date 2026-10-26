@@ -10,8 +10,15 @@ from decimal import Decimal
 from rapidfuzz import fuzz
 
 from app.brain import rules as R
+from app.brain.mortgage import LoanMismatchError, split_payment
 from app.brain.normalize import normalize
-from app.models import CategorizedTransaction, Category, RawTransaction
+from app.models import (
+    CategorizedTransaction,
+    Category,
+    LoanDetails,
+    RawTransaction,
+    Split,
+)
 
 THRESHOLD = 0.75        # below this we ask the user instead of guessing
 CONFLICT_MARGIN = 0.10  # two categories this close = we are not sure
@@ -60,8 +67,9 @@ def _score(text: str, amount: Decimal) -> dict[Category, tuple[float, list[str]]
 
 
 class Categorizer:
-    def __init__(self) -> None:
+    def __init__(self, loan: LoanDetails | None = None) -> None:
         self._learned: dict[str, Category] = {}
+        self.loan = loan  # lets us split mortgage payments; None = send to review
 
     def learn(self, description: str, category: Category) -> None:
         """Remember a user's correction for every similar future row."""
@@ -151,12 +159,53 @@ class Categorizer:
         return Category.NEEDS_REVIEW, round(confidence, 2), why
 
     # ------------------------------------------------------------------
+    def _try_mortgage_split(
+        self, tx: RawTransaction, matched: dict[int, int]
+    ) -> tuple[float, str, list[Split]]:
+        """Split a mortgage payment using the loan details.
+
+        Raises LoanMismatchError when it cannot be matched to the schedule.
+        """
+        scheduled = split_payment(self.loan, tx.date, -tx.amount)
+        if scheduled.number in matched:
+            raise LoanMismatchError(
+                f"Payment #{scheduled.number} was already matched by row "
+                f"{matched[scheduled.number]}."
+            )
+        matched[scheduled.number] = tx.row_number
+        splits = [
+            Split(category=Category.MORTGAGE_INTEREST, amount=-scheduled.interest),
+            Split(category=Category.MORTGAGE_PRINCIPAL, amount=-scheduled.principal),
+        ]
+        why = (
+            f"Mortgage payment #{scheduled.number} of {self.loan.term_months}, split from "
+            f"your loan details: interest {scheduled.interest}, principal "
+            f"{scheduled.principal}."
+        )
+        return 0.95, why, splits
+
+    # ------------------------------------------------------------------
     def categorize_all(self, transactions: list[RawTransaction]) -> list[CategorizedTransaction]:
         results: list[CategorizedTransaction] = []
         seen: dict[tuple, int] = {}
+        matched_payments: dict[int, int] = {}  # payment number -> row number
 
         for index, tx in enumerate(transactions, start=1):
             text, (category, confidence, explanation) = self.decide(tx.description, tx.amount)
+            splits: list[Split] = []
+
+            if (
+                self.loan is not None
+                and tx.amount < 0
+                and _first_match(text, R.MORTGAGE_PHRASES)
+            ):
+                try:
+                    confidence, explanation, splits = self._try_mortgage_split(
+                        tx, matched_payments
+                    )
+                    category = Category.MORTGAGE_PAYMENT
+                except LoanMismatchError as exc:
+                    explanation = f"Mortgage payment could not be split: {exc}"
 
             key = (tx.date, tx.description, tx.amount)
             is_duplicate = key in seen
@@ -176,6 +225,7 @@ class Categorizer:
                     confidence=round(confidence, 2),
                     explanation=explanation,
                     is_duplicate=is_duplicate,
+                    splits=splits,
                 )
             )
         return results
